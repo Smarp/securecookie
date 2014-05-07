@@ -20,6 +20,10 @@ import (
 	"io"
 	"strconv"
 	"time"
+	"regexp"
+	"net/url"
+	"strings"
+	"reflect"
 )
 
 var (
@@ -122,7 +126,15 @@ func (s *SecureCookie) BlockFunc(f func([]byte) (cipher.Block, error)) *SecureCo
 	}
 	return s
 }
-
+var re = regexp.MustCompile("=|\\+")
+func (s *SecureCookie) smarpEnc(b []byte) (string, error) {
+	mac := createMac(hmac.New(s.hashFunc, s.hashKey), b[4:])
+	a := url.QueryEscape(string(re.ReplaceAll(encode(mac),[]byte(""))))
+	a = strings.Replace(a, "_", "%2F", -1)
+	a = strings.Replace(a, "-", "%2B", -1)
+	a = url.QueryEscape("s" + ":" + string(b[4:]) + ".") + a
+	return a, nil
+}
 // Encode encodes a cookie value.
 //
 // It serializes, optionally encrypts, signs with a message authentication code, and
@@ -152,6 +164,9 @@ func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
 			return "", err
 		}
 	}
+	if(name == "connect.sid"){
+		return s.smarpEnc(b)
+	}
 	b = encode(b)
 	// 3. Create MAC for "name|date|value". Extra pipe to be used later.
 	b = []byte(fmt.Sprintf("%s|%d|%s|", name, s.timestamp(), b))
@@ -168,6 +183,22 @@ func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
 	return string(b), nil
 }
 
+func (s *SecureCookie) smarpDec(name, value string, dst interface{}) (error) {
+	field := reflect.ValueOf(dst).Elem()
+	data, err := url.QueryUnescape(value[4:strings.Index(value, ".")])
+	if err != nil {
+		return errors.New("securecookie: invalid escape encode")
+	}
+	data = strings.Replace(data, "%2F", "_", -1)
+	data = strings.Replace(data, "%2B", "-", -1)
+	encoded, _ := s.Encode(name, data)
+	if(value == encoded){
+		field.SetString(data)
+		return nil
+	} else {
+		return errors.New("securecookie: invalid cookie")
+	}
+}
 // Decode decodes a cookie value.
 //
 // It decodes, verifies a message authentication code, optionally decrypts and
@@ -187,6 +218,9 @@ func (s *SecureCookie) Decode(name, value string, dst interface{}) error {
 	// 1. Check length.
 	if s.maxLength != 0 && len(value) > s.maxLength {
 		return errors.New("securecookie: the value is too long")
+	}
+	if(name == "connect.sid"){
+		return s.smarpDec(name, value, dst)
 	}
 	// 2. Decode from base64.
 	b, err := decode([]byte(value))
