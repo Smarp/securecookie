@@ -128,6 +128,9 @@ func (s *SecureCookie) BlockFunc(f func([]byte) (cipher.Block, error)) *SecureCo
 }
 var re = regexp.MustCompile("=|\\+")
 func (s *SecureCookie) smarpEnc(b []byte) (string, error) {
+	if len(b) < 5 {
+		return "", errors.New("securecookie: cookie value too short")
+	}
 	mac := createMac(hmac.New(s.hashFunc, s.hashKey), b[4:])
 	a := url.QueryEscape(string(re.ReplaceAll(encode(mac),[]byte(""))))
 	a = strings.Replace(a, "_", "%2F", -1)
@@ -185,7 +188,12 @@ func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
 
 func (s *SecureCookie) smarpDec(name, value string, dst interface{}) (error) {
 	field := reflect.ValueOf(dst).Elem()
-	data, err := url.QueryUnescape(value[4:strings.Index(value, ".")])
+	index := strings.Index(value, ".")
+	// index must be `gt` or `eq` 4 to be valid, index `st` than 4 (including -1, which is not found) is invalid
+	if index < 4 {
+		return errors.New("securecookie: cookie value too short")
+	}
+	data, err := url.QueryUnescape(value[4:index])
 	if err != nil {
 		return errors.New("securecookie: invalid escape encode")
 	}
