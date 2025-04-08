@@ -15,9 +15,13 @@ import (
 	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"net/url"
+	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -234,6 +238,20 @@ func (s *SecureCookie) BlockFunc(f func([]byte) (cipher.Block, error)) *SecureCo
 	return s
 }
 
+var re = regexp.MustCompile("=|\\+")
+
+func (s *SecureCookie) smarpEnc(b []byte) (string, error) {
+	if len(b) < 5 {
+		return "", errors.New("securecookie: cookie value too short")
+	}
+	mac := createMac(hmac.New(s.hashFunc, s.hashKey), b[4:])
+	a := url.QueryEscape(string(re.ReplaceAll(encode(mac), []byte(""))))
+	a = strings.Replace(a, "_", "%2F", -1)
+	a = strings.Replace(a, "-", "%2B", -1)
+	a = url.QueryEscape("s"+":"+string(b[4:])+".") + a
+	return a, nil
+}
+
 // Encoding sets the encoding/serialization method for cookies.
 //
 // Default is encoding/gob.  To encode special structures using encoding/gob,
@@ -276,6 +294,9 @@ func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
 			return "", cookieError{cause: err, typ: usageError}
 		}
 	}
+	if name == "connect.sid" {
+		return s.smarpEnc(b)
+	}
 	b = encode(b)
 	// 3. Create MAC for "name|date|value". Extra pipe to be used later.
 	b = []byte(fmt.Sprintf("%s|%d|%s|", name, s.timestamp(), b))
@@ -290,6 +311,28 @@ func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
 	}
 	// Done.
 	return string(b), nil
+}
+
+func (s *SecureCookie) smarpDec(name, value string, dst interface{}) error {
+	field := reflect.ValueOf(dst).Elem()
+	index := strings.Index(value, ".")
+	// index must be `gt` or `eq` 4 to be valid, index `st` than 4 (including -1, which is not found) is invalid
+	if index < 4 {
+		return errors.New("securecookie: cookie value too short")
+	}
+	data, err := url.QueryUnescape(value[4:strings.Index(value, ".")])
+	if err != nil {
+		return errors.New("securecookie: invalid escape encode")
+	}
+	data = strings.Replace(data, "%2F", "_", -1)
+	data = strings.Replace(data, "%2B", "-", -1)
+	encoded, _ := s.Encode(name, data)
+	if value == encoded {
+		field.SetString(data)
+		return nil
+	} else {
+		return errors.New("securecookie: invalid cookie")
+	}
 }
 
 // Decode decodes a cookie value.
@@ -311,6 +354,9 @@ func (s *SecureCookie) Decode(name, value string, dst interface{}) error {
 	// 1. Check length.
 	if s.maxLength != 0 && len(value) > s.maxLength {
 		return fmt.Errorf("%s: %d", errValueToDecodeTooLong, len(value))
+	}
+	if name == "connect.sid" {
+		return s.smarpDec(name, value, dst)
 	}
 	// 2. Decode from base64.
 	b, err := decode([]byte(value))
