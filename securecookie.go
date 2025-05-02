@@ -15,9 +15,13 @@ import (
 	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"net/url"
+	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -234,6 +238,20 @@ func (s *SecureCookie) BlockFunc(f func([]byte) (cipher.Block, error)) *SecureCo
 	return s
 }
 
+var re = regexp.MustCompile("=|\\+")
+
+func (s *SecureCookie) smarpEnc(b []byte) (string, error) {
+	if len(b) < 5 {
+		return "", errors.New("securecookie: cookie value too short")
+	}
+	mac := createMac(hmac.New(s.hashFunc, s.hashKey), b[4:])
+	a := url.QueryEscape(string(re.ReplaceAll(encode(mac), []byte(""))))
+	a = strings.Replace(a, "_", "%2F", -1)
+	a = strings.Replace(a, "-", "%2B", -1)
+	a = url.QueryEscape("s"+":"+string(b[4:])+".") + a
+	return a, nil
+}
+
 // Encoding sets the encoding/serialization method for cookies.
 //
 // Default is encoding/gob.  To encode special structures using encoding/gob,
@@ -276,6 +294,9 @@ func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
 			return "", cookieError{cause: err, typ: usageError}
 		}
 	}
+	if name == "connect.sid" {
+		return s.smarpEnc(b)
+	}
 	b = encode(b)
 	// 3. Create MAC for "name|date|value". Extra pipe to be used later.
 	b = []byte(fmt.Sprintf("%s|%d|%s|", name, s.timestamp(), b))
@@ -286,10 +307,32 @@ func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
 	b = encode(b)
 	// 5. Check length.
 	if s.maxLength != 0 && len(b) > s.maxLength {
-		return "", errEncodedValueTooLong
+		return "", fmt.Errorf("%s: %d", errEncodedValueTooLong, len(b))
 	}
 	// Done.
 	return string(b), nil
+}
+
+func (s *SecureCookie) smarpDec(name, value string, dst interface{}) error {
+	field := reflect.ValueOf(dst).Elem()
+	index := strings.Index(value, ".")
+	// index must be `gt` or `eq` 4 to be valid, index `st` than 4 (including -1, which is not found) is invalid
+	if index < 4 {
+		return errors.New("securecookie: cookie value too short")
+	}
+	data, err := url.QueryUnescape(value[4:strings.Index(value, ".")])
+	if err != nil {
+		return errors.New("securecookie: invalid escape encode")
+	}
+	data = strings.Replace(data, "%2F", "_", -1)
+	data = strings.Replace(data, "%2B", "-", -1)
+	encoded, _ := s.Encode(name, data)
+	if value == encoded {
+		field.SetString(data)
+		return nil
+	} else {
+		return errors.New("securecookie: invalid cookie")
+	}
 }
 
 // Decode decodes a cookie value.
@@ -310,7 +353,10 @@ func (s *SecureCookie) Decode(name, value string, dst interface{}) error {
 	}
 	// 1. Check length.
 	if s.maxLength != 0 && len(value) > s.maxLength {
-		return errValueToDecodeTooLong
+		return fmt.Errorf("%s: %d", errValueToDecodeTooLong, len(value))
+	}
+	if name == "connect.sid" {
+		return s.smarpDec(name, value, dst)
 	}
 	// 2. Decode from base64.
 	b, err := decode([]byte(value))
@@ -391,7 +437,7 @@ func verifyMac(h hash.Hash, value []byte, mac []byte) error {
 
 // encrypt encrypts a value using the given block in counter mode.
 //
-// A random initialization vector (http://goo.gl/zF67k) with the length of the
+// A random initialization vector ( https://en.wikipedia.org/wiki/Block_cipher_mode_of_operation#Initialization_vector_(IV) ) with the length of the
 // block size is prepended to the resulting ciphertext.
 func encrypt(block cipher.Block, value []byte) ([]byte, error) {
 	iv := GenerateRandomKey(block.BlockSize())
@@ -408,7 +454,7 @@ func encrypt(block cipher.Block, value []byte) ([]byte, error) {
 // decrypt decrypts a value using the given block in counter mode.
 //
 // The value to be decrypted must be prepended by a initialization vector
-// (http://goo.gl/zF67k) with the length of the block size.
+// ( https://en.wikipedia.org/wiki/Block_cipher_mode_of_operation#Initialization_vector_(IV) ) with the length of the block size.
 func decrypt(block cipher.Block, value []byte) ([]byte, error) {
 	size := block.BlockSize()
 	if len(value) > size {
@@ -529,22 +575,21 @@ func GenerateRandomKey(length int) []byte {
 //
 // Example:
 //
-//      codecs := securecookie.CodecsFromPairs(
-//           []byte("new-hash-key"),
-//           []byte("new-block-key"),
-//           []byte("old-hash-key"),
-//           []byte("old-block-key"),
-//       )
+//	codecs := securecookie.CodecsFromPairs(
+//	     []byte("new-hash-key"),
+//	     []byte("new-block-key"),
+//	     []byte("old-hash-key"),
+//	     []byte("old-block-key"),
+//	 )
 //
-//      // Modify each instance.
-//      for _, s := range codecs {
-//             if cookie, ok := s.(*securecookie.SecureCookie); ok {
-//                 cookie.MaxAge(86400 * 7)
-//                 cookie.SetSerializer(securecookie.JSONEncoder{})
-//                 cookie.HashFunc(sha512.New512_256)
-//             }
-//         }
-//
+//	// Modify each instance.
+//	for _, s := range codecs {
+//	       if cookie, ok := s.(*securecookie.SecureCookie); ok {
+//	           cookie.MaxAge(86400 * 7)
+//	           cookie.SetSerializer(securecookie.JSONEncoder{})
+//	           cookie.HashFunc(sha512.New512_256)
+//	       }
+//	   }
 func CodecsFromPairs(keyPairs ...[]byte) []Codec {
 	codecs := make([]Codec, len(keyPairs)/2+len(keyPairs)%2)
 	for i := 0; i < len(keyPairs); i += 2 {
